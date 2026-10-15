@@ -1,0 +1,11 @@
+schema = 1
+[project]
+name = "hello"
+root = "."
+[[workloads]]
+name = "app"
+kind = "backend"
+engine = "docker"
+dockerfile = "Dockerfile"
+context = "."
+platforms = ["linux/amd64"]

@@ -1,0 +1,14 @@
+[extend]
+useDefault = true
+
+# Reviewed go.sum integrity hashes, not credentials. Keep the rest of the patch scanned.
+[[allowlists]]
+description = "Two exact Go integrity checksum lines in the Buildx security patch"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)packaging/patches/buildx-security\.patch$''']
+regexTarget = "line"
+regexes = [
+  '''^\s*github\.com/docker/docker-credential-helpers v0\.9\.8 h1:bIREROb7So6PRlq6KTtdS9MPEjC29OQRkFNlvK2OX8Q=\s*$''',
+  '''^\s*github\.com/moby/moby/api v1\.55\.0 h1:2/sexvQyqIWS8pRSCFddBfpW2qE7vR7FCL\+vN8pxwMc=\s*$''',
+]

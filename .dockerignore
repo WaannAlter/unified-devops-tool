@@ -1,0 +1,14 @@
+.git
+.github
+target
+**/target
+**/__pycache__
+*.py[cod]
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+reports
+*.log

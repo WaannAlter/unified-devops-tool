@@ -1,0 +1,8 @@
+[[commands]]
+name = "Synthetic health service tests"
+group = "demo"
+component = "backend"
+suite = "unit"
+cwd = "../hello"
+argv = ["python3", "-m", "unittest", "-v"]
+timeout = 30

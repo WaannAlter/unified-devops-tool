@@ -1,0 +1,17 @@
+services:
+  app:
+    image: ${IMAGE_REF:?Set IMAGE_REF to an immutable image reference}
+    ports:
+      - "127.0.0.1:@PORT@:@PORT@"
+    restart: unless-stopped
+    user: "@USER@"
+    read_only: true
+@TMPFS@    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
