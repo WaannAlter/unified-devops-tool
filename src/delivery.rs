@@ -1129,6 +1129,8 @@ fn private_dir(path: &Path, create: bool) -> Result<()> {
         builder
             .create(path)
             .context("cannot create private delivery state directory")?;
+        #[cfg(windows)]
+        crate::process::protect_new_directory(path)?;
     }
     if path.exists() {
         let meta = fs::symlink_metadata(path)?;
@@ -1144,6 +1146,8 @@ fn private_dir(path: &Path, create: bool) -> Result<()> {
                 "delivery state directory must be private (0700)"
             );
         }
+        #[cfg(windows)]
+        crate::process::require_private_path(path)?;
     }
     Ok(())
 }
@@ -1162,6 +1166,8 @@ fn regular_private(path: &Path) -> Result<()> {
                 "delivery state file must be private (0600)"
             );
         }
+        #[cfg(windows)]
+        crate::process::require_private_path(path)?;
     }
     Ok(())
 }

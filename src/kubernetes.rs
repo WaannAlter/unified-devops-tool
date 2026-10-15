@@ -161,6 +161,10 @@ fn validate_deployment(item: &Value) -> Result<()> {
     );
     let pod = &spec["template"]["spec"];
     ensure!(pod["hostNetwork"] != true, "hostNetwork is forbidden");
+    ensure!(pod["hostPID"] != true, "hostPID is forbidden");
+    ensure!(pod["hostIPC"] != true, "hostIPC is forbidden");
+    let pod_security = &pod["securityContext"];
+    ensure!(pod_security["runAsUser"] != 0, "root user is forbidden");
     if let Some(volumes) = pod["volumes"].as_array() {
         ensure!(
             !volumes.iter().any(|volume| !volume["hostPath"].is_null()),
@@ -190,9 +194,43 @@ fn validate_deployment(item: &Value) -> Result<()> {
                 digest_image(image),
                 "{field} image must be sha256 digest-pinned"
             );
+            let security = &container["securityContext"];
             ensure!(
-                container["securityContext"]["privileged"] != true,
+                security["privileged"] != true,
                 "privileged containers are forbidden"
+            );
+            ensure!(
+                security["runAsNonRoot"] == true
+                    || (security["runAsNonRoot"].is_null() && pod_security["runAsNonRoot"] == true),
+                "each container must run as non-root"
+            );
+            ensure!(security["runAsUser"] != 0, "root user is forbidden");
+            ensure!(
+                security["allowPrivilegeEscalation"] == false,
+                "privilege escalation must be disabled"
+            );
+            ensure!(
+                security["capabilities"]["drop"]
+                    .as_array()
+                    .is_some_and(|drop| drop.iter().any(|capability| capability == "ALL")),
+                "each container must drop ALL capabilities"
+            );
+            let added = &security["capabilities"]["add"];
+            ensure!(
+                added.is_null()
+                    || added.as_array().is_some_and(|add| add
+                        .iter()
+                        .all(|capability| capability == "NET_BIND_SERVICE")),
+                "only NET_BIND_SERVICE may be added"
+            );
+            let seccomp = if security["seccompProfile"].is_null() {
+                &pod_security["seccompProfile"]
+            } else {
+                &security["seccompProfile"]
+            };
+            ensure!(
+                seccomp["type"] == "RuntimeDefault" || seccomp["type"] == "Localhost",
+                "each container needs RuntimeDefault or Localhost seccomp"
             );
             if field == "containers" {
                 ensure!(
@@ -242,23 +280,8 @@ fn apply(options: &ApplyOptions) -> Result<()> {
         );
         return Ok(());
     }
-    let filename = options
-        .file
-        .canonicalize()
-        .context("cannot resolve manifest path")?;
-    checked(
-        kubectl(&options.target)
-            .arg("apply")
-            .arg("--dry-run=server")
-            .arg("-f")
-            .arg(&filename),
-    )?;
-    checked(
-        kubectl(&options.target)
-            .arg("apply")
-            .arg("-f")
-            .arg(&filename),
-    )?;
+    checked(apply_plan(&options.target, bytes.clone(), true))?;
+    checked(apply_plan(&options.target, bytes, false))?;
     for name in &deployments {
         checked(rollout_plan(&options.target, name, options.wait_timeout))?;
     }
@@ -267,6 +290,14 @@ fn apply(options: &ApplyOptions) -> Result<()> {
         json!({"result":"applied","executed":true,"namespace":options.target.namespace,"deployments":deployments})
     );
     Ok(())
+}
+
+fn apply_plan(target: &TargetOptions, bytes: Vec<u8>, dry_run: bool) -> ProcessPlan {
+    let mut plan = kubectl(target).arg("apply");
+    if dry_run {
+        plan = plan.arg("--dry-run=server");
+    }
+    plan.arg("-f").arg("-").input_bytes(bytes)
 }
 
 fn rollout_plan(target: &TargetOptions, name: &str, seconds: u64) -> ProcessPlan {
@@ -354,7 +385,7 @@ mod tests {
     }
 
     fn manifest() -> Value {
-        json!({"apiVersion":"v1","kind":"List","items":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"demo-development"},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"api","image":format!("example/api@sha256:{}", "a".repeat(64)),"readinessProbe":{"httpGet":{"path":"/readyz","port":8080}}}]}}}}]})
+        json!({"apiVersion":"v1","kind":"List","items":[{"apiVersion":"apps/v1","kind":"Deployment","metadata":{"name":"api","namespace":"demo-development"},"spec":{"replicas":1,"template":{"spec":{"hostPID":false,"hostIPC":false,"securityContext":{"runAsNonRoot":true,"runAsUser":1000,"seccompProfile":{"type":"RuntimeDefault"}},"containers":[{"name":"api","image":format!("example/api@sha256:{}", "a".repeat(64)),"readinessProbe":{"httpGet":{"path":"/readyz","port":8080}},"securityContext":{"runAsNonRoot":true,"runAsUser":1000,"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"],"add":[]},"seccompProfile":{"type":"RuntimeDefault"}}}]}}}}]})
     }
 
     #[test]
@@ -415,6 +446,116 @@ mod tests {
                 "accepted {path}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_unsafe_pod_and_container_contexts() {
+        for (path, value) in [
+            ("/spec/template/spec/hostPID", json!(true)),
+            ("/spec/template/spec/hostIPC", json!(true)),
+            ("/spec/template/spec/securityContext/runAsUser", json!(0)),
+            (
+                "/spec/template/spec/containers/0/securityContext/runAsNonRoot",
+                json!(false),
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/runAsUser",
+                json!(0),
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation",
+                json!(true),
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation",
+                Value::Null,
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/capabilities/drop",
+                json!([]),
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/capabilities/add",
+                json!(["SYS_ADMIN"]),
+            ),
+            (
+                "/spec/template/spec/containers/0/securityContext/seccompProfile/type",
+                json!("Unconfined"),
+            ),
+        ] {
+            let mut list = manifest();
+            *list["items"][0]
+                .pointer_mut(path)
+                .unwrap_or_else(|| panic!("missing fixture path: {path}")) = value;
+            assert!(
+                validate_manifest(&serde_json::to_vec(&list).unwrap(), "demo-development").is_err(),
+                "accepted {path}"
+            );
+        }
+        for (pod_path, container_path, value) in [
+            (
+                "/spec/template/spec/securityContext/runAsNonRoot",
+                "/spec/template/spec/containers/0/securityContext/runAsNonRoot",
+                json!(false),
+            ),
+            (
+                "/spec/template/spec/securityContext/seccompProfile/type",
+                "/spec/template/spec/containers/0/securityContext/seccompProfile",
+                json!("Unconfined"),
+            ),
+        ] {
+            let mut list = manifest();
+            *list["items"][0].pointer_mut(pod_path).unwrap() = value;
+            *list["items"][0].pointer_mut(container_path).unwrap() = Value::Null;
+            assert!(
+                validate_manifest(&serde_json::to_vec(&list).unwrap(), "demo-development").is_err(),
+                "accepted inherited {pod_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_init_containers_and_narrow_capability_exception() {
+        let mut list = manifest();
+        list["items"][0]["spec"]["template"]["spec"]["containers"][0]["securityContext"]["capabilities"]
+            ["add"] = json!(["NET_BIND_SERVICE"]);
+        list["items"][0]["spec"]["template"]["spec"]["initContainers"] = json!([{
+            "name":"init",
+            "image":format!("example/init@sha256:{}", "b".repeat(64)),
+            "securityContext":{
+                "allowPrivilegeEscalation":false,
+                "capabilities":{"drop":["ALL"]}
+            }
+        }]);
+        assert!(validate_manifest(&serde_json::to_vec(&list).unwrap(), "demo-development").is_ok());
+        list["items"][0]["spec"]["template"]["spec"]["initContainers"][0]["securityContext"]["capabilities"]
+            ["drop"] = json!([]);
+        assert!(
+            validate_manifest(&serde_json::to_vec(&list).unwrap(), "demo-development").is_err()
+        );
+    }
+
+    #[test]
+    fn apply_plans_bind_identical_validated_bytes_to_stdin() {
+        let bytes = serde_json::to_vec(&manifest()).unwrap();
+        validate_manifest(&bytes, "demo-development").unwrap();
+        assert_eq!(
+            apply_plan(&target(), bytes.clone(), true),
+            kubectl(&target())
+                .arg("apply")
+                .arg("--dry-run=server")
+                .arg("-f")
+                .arg("-")
+                .input_bytes(bytes.clone())
+        );
+        assert_eq!(
+            apply_plan(&target(), bytes.clone(), false),
+            kubectl(&target())
+                .arg("apply")
+                .arg("-f")
+                .arg("-")
+                .input_bytes(bytes)
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ mod source;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use config::{Engine, LoadedConfig, Workload};
 use process::ProcessPlan;
@@ -605,9 +605,24 @@ fn scan(
     let plan = scan_plan(&image, ignore_unfixed, os_only);
     println!("image\t{image}");
     println!("command\t{}", plan.display());
+    let secrets = publish::secret_scan_plan(&image);
+    println!("secret_command\t{}", secrets.display());
     if execute {
         verify(loaded, name, Some(&commit))?;
-        plan.run()?;
+        let scan = plan.capture_isolated()?;
+        ensure!(
+            scan.status.success(),
+            "vulnerability scan failed ({}); captured output withheld",
+            scan.status
+        );
+        publish::validate_scan(&serde_json::from_slice(&scan.stdout)?, &image)?;
+        let scan = secrets.capture_isolated()?;
+        ensure!(
+            scan.status.success(),
+            "secret scan failed ({}); captured output withheld",
+            scan.status
+        );
+        publish::validate_secret_scan(&serde_json::from_slice(&scan.stdout)?, &image)?;
         println!("result\tscan-passed");
     } else {
         println!("result\tplan-only (pass --execute to scan)");
@@ -616,22 +631,7 @@ fn scan(
 }
 
 fn scan_plan(image: &str, ignore_unfixed: bool, os_only: bool) -> ProcessPlan {
-    let mut plan = ProcessPlan::new("trivy")
-        .arg("image")
-        .arg("--scanners")
-        .arg("vuln,secret")
-        .arg("--exit-code")
-        .arg("1")
-        .arg("--severity")
-        .arg("HIGH,CRITICAL")
-        .arg("--no-progress");
-    if ignore_unfixed {
-        plan = plan.arg("--ignore-unfixed");
-    }
-    if os_only {
-        plan = plan.arg("--pkg-types").arg("os");
-    }
-    plan.arg(image)
+    publish::scan_plan(image, ignore_unfixed, os_only)
 }
 
 fn quality(

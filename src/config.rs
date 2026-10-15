@@ -209,7 +209,15 @@ pub(crate) fn contained_new_file(root: &Path, path: &Path) -> Result<PathBuf> {
     if !resolved_parent.starts_with(root) {
         bail!("path {} escapes the project root", path.display());
     }
-    Ok(resolved_parent.join(file_name))
+    let output = resolved_parent.join(file_name);
+    match fs::symlink_metadata(&output) {
+        Ok(_) => bail!(
+            "output already exists; refusing to overwrite {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(output),
+        Err(error) => Err(error).context("cannot inspect output destination"),
+    }
 }
 
 fn valid_env_name(value: &str) -> bool {
@@ -285,6 +293,30 @@ context = "."
         assert!(valid_env_name("DEMO_DB_PASSWORD"));
         assert!(!valid_env_name("password; whoami"));
         assert!(!valid_env_name("lowercase"));
+    }
+
+    #[test]
+    fn new_output_refuses_existing_files_without_modifying_them() {
+        let root = std::env::temp_dir().join(format!(
+            "devops-output-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let output = root.join("report.json");
+        assert_eq!(
+            contained_new_file(&root, Path::new("report.json")).unwrap(),
+            output
+        );
+        fs::write(&output, b"keep me").unwrap();
+        assert!(contained_new_file(&root, Path::new("report.json")).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"keep me");
+        fs::remove_file(output).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

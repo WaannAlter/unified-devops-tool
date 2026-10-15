@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux-only publish regression harness; uses temporary Git state and mock Docker/Trivy."""
+"""Publish regression harness with temporary Git state and mock Docker/Trivy."""
 import argparse
 import hashlib
 import io
@@ -14,6 +14,26 @@ import tarfile
 
 DIGEST = "sha256:" + "a" * 64
 MOVED = "sha256:" + "b" * 64
+WINDOWS_LAUNCHER = None
+
+LAUNCHER = r'''use std::{env, process::{self, Command}};
+fn main() {
+    let script = env::current_exe().unwrap().with_extension("py");
+    let status = Command::new(env::var_os("MOCK_PYTHON").unwrap())
+        .arg(script).args(env::args_os().skip(1)).status().unwrap();
+    process::exit(status.code().unwrap_or(1));
+}
+'''
+
+PRIVATE_EVIDENCE_ACL = r'''
+$ErrorActionPreference = 'Stop'
+$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = New-Object System.Security.AccessControl.DirectorySecurity
+$acl.SetOwner($sid)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+[System.IO.Directory]::SetAccessControl($env:MOCK_EVIDENCE_DIR, $acl)
+'''
 
 DOCKER = r'''#!/usr/bin/env python3
 import io, json, os, sys, tarfile
@@ -61,11 +81,21 @@ else: print("unexpected docker: "+repr(a),file=sys.stderr); sys.exit(2)
 
 TRIVY = r'''#!/usr/bin/env python3
 import json, os, sys
+from pathlib import Path
 p=os.environ["MOCK_STATE"]; s=json.load(open(p)); a=sys.argv[1:]
 if a[:1] == ["--version"]: print(json.dumps({"Version":"mock","VulnerabilityDB":{"UpdatedAt":"2026-01-01T00:00:00Z"}}))
 elif a[:1] == ["image"]:
+ if any(k.upper().startswith('TRIVY_') for k in os.environ): print('uncontrolled scanner environment',file=sys.stderr); sys.exit(2)
+ for flag, fallback in (('--config','trivy.yaml'), ('--ignorefile','.trivyignore'), ('--secret-config','trivy-secret.yaml')):
+  if flag not in a or a[a.index(flag)+1] != '': print('unsafe scanner config',file=sys.stderr); sys.exit(2)
+  if Path(fallback).exists(): print('empty flag loaded '+fallback+' from scanner cwd',file=sys.stderr); sys.exit(2)
+ secret=a[a.index('--scanners')+1]=='secret'
  if s.get("require_local_artifact") and a[-1] not in s.get("local_images",[]): print("local artifact was pruned",file=sys.stderr); sys.exit(2)
- if s.get("expected_trivy_args") and not all(arg in a for arg in s["expected_trivy_args"]): print("missing expected Trivy args",file=sys.stderr); sys.exit(2)
+ if not secret and s.get("expected_trivy_args") and not all(arg in a for arg in s["expected_trivy_args"]): print("missing expected Trivy args",file=sys.stderr); sys.exit(2)
+ if secret:
+  if a[a.index('--severity')+1] != 'UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL' or '--pkg-types' in a or '--ignore-unfixed' in a: sys.exit(2)
+  print(json.dumps({'ArtifactName':a[-1], 'Results':[{'Target':'file', 'Secrets':[{'Severity':'LOW','Match':'do-not-print'}] if s.get('secret_finding') else []}]}))
+  sys.exit(1 if s.get('secret_finding') else 0)
  report={"ArtifactName":"other" if s.get("bad_artifact") else a[-1],"Results":[{"Target":"mock","Vulnerabilities":[{"Severity":"HIGH","VulnerabilityID":"CVE-2026-12345","Description":"password=do-not-print","PkgName":"::warning::injected"},{"Severity":"CRITICAL","VulnerabilityID":"CVE-2026-12345::error::injected"}] if s.get("high_finding") else []}]}; print(json.dumps(report))
  if s.get("high_finding"): sys.exit(1)
  if s.get("scan_fail_once"):
@@ -111,10 +141,17 @@ platforms = ["linux/amd64"]
     rev=cmd(["git","rev-parse","HEAD"],repo,os.environ.copy()).stdout.strip()
     bindir=base/"mock-bin"; bindir.mkdir()
     for name, body in (("docker",DOCKER),("trivy",TRIVY)):
-        path=bindir/name; path.write_text(body); path.chmod(0o755)
+        path=bindir/(name+('.py' if os.name == 'nt' else ''))
+        path.write_text(body)
+        if os.name == 'nt': shutil.copy2(WINDOWS_LAUNCHER,bindir/(name+'.exe'))
+        else: path.chmod(0o755)
     state=base/"state.json"; state.write_text(json.dumps({"refs":{},"builds":0}))
     evidence=base/"evidence"; evidence.mkdir()
+    if os.name == 'nt':
+        acl_env=os.environ.copy(); acl_env['MOCK_EVIDENCE_DIR']=str(evidence)
+        cmd(['powershell.exe','-NoProfile','-NonInteractive','-Command',PRIVATE_EVIDENCE_ACL],base,acl_env)
     env=os.environ.copy(); env.update({"PATH":str(bindir)+os.pathsep+env["PATH"],"MOCK_STATE":str(state),"MOCK_REV":rev})
+    if os.name == 'nt': env['MOCK_PYTHON']=sys.executable
     return repo, rev, evidence, state, env
 
 def publish(binary, repo, rev, evidence, env, execute=True, expect=True, extra=()):
@@ -149,9 +186,10 @@ def test_scan_retry(binary, base):
     repo, rev, evidence, statefile, env=fixture(base,binary); set_state(statefile,scan_fail_once=True)
     env['GITHUB_ACTIONS']='true'
     failed=publish(binary,repo,rev,evidence,env,True,False)
-    assert 'FATAL synthetic scan failure' in failed.stderr
+    assert 'failure output withheld' in failed.stderr
+    assert 'FATAL synthetic scan failure' not in failed.stderr
     assert 'do-not-print' not in failed.stderr
-    assert '::stop-commands::' in failed.stderr
+    assert '::stop-commands::' not in failed.stderr
     assert not failed.stdout
     publish(binary,repo,rev,evidence,env)
     assert state(statefile)["builds"] == 1
@@ -160,10 +198,11 @@ def test_interrupted_build(binary, base):
     repo, rev, evidence, statefile, env=fixture(base,binary); set_state(statefile,fail_after_push=True)
     env['GITHUB_ACTIONS']='true'
     failed=publish(binary,repo,rev,evidence,env,True,False)
-    assert 'ERROR: synthetic build failure' in failed.stderr
+    assert 'failure output withheld' in failed.stderr
+    assert 'ERROR: synthetic build failure' not in failed.stderr
     assert 'do-not-print' not in failed.stderr and '::warning::injected' not in failed.stderr
     assert 'abcdefghijklmnopqrstuvwxyz012345' not in failed.stderr
-    assert failed.stderr.index('::stop-commands::') < failed.stderr.index('ERROR: synthetic build failure')
+    assert '::stop-commands::' not in failed.stderr
     assert not failed.stdout
     set_state(statefile,fail_after_push=False)
     publish(binary,repo,rev,evidence,env,True,False); assert state(statefile)["builds"] == 1
@@ -180,8 +219,8 @@ def test_build_metadata_without_success_marker(binary, base):
     assert 'localhost:5000/demo/api:'+rev not in state(statefile)['refs']
 
 def test_lookup_errors(binary, base):
-    for error in ("unauthorized: manifest unknown", "connection refused"):
-        repo, rev, evidence, statefile, env=fixture(base/error.replace(" ","_"),binary); set_state(statefile,lookup_error=error)
+    for index, error in enumerate(("unauthorized: manifest unknown", "connection refused")):
+        repo, rev, evidence, statefile, env=fixture(base/str(index),binary); set_state(statefile,lookup_error=error)
         publish(binary,repo,rev,evidence,env,True,False); assert state(statefile)["builds"] == 0
 
 def test_conflicts_and_move(binary, base):
@@ -217,7 +256,7 @@ def test_no_config(binary, base):
     inputs=plan['inputs']
     assert inputs['config_path'] is None and inputs['config_sha256'] is None
     assert inputs['context'] == 'api' and inputs['dockerfile'] == 'api/Dockerfile'
-    assert inputs['engine'] == 'docker' and inputs['schema'] == 3
+    assert inputs['engine'] == 'docker' and inputs['schema'] == 4
     publish(binary,repo,rev,evidence,env)
     publish(binary,repo,rev,evidence,env)
     sealed=json.loads((evidence_dir(evidence,rev)/'inputs.json').read_text())
@@ -287,19 +326,28 @@ def test_reuse_sealed(binary, base):
     original=json.loads(publish(binary,repo,rev,evidence,env).stdout)
     directory=evidence_dir(evidence,rev)
     sealed={p.name:p.read_bytes() for p in directory.iterdir() if p.name in json.loads((directory/'checksums.json').read_text())}
-    alternate=base/'upgraded-tool'
+    alternate=base/('upgraded-tool.exe' if os.name == 'nt' else 'upgraded-tool')
     shutil.copy2(binary,alternate)
     with alternate.open('ab') as output: output.write(b'upgraded test binary\n')
     assert hashlib.sha256(binary.read_bytes()).hexdigest() != hashlib.sha256(alternate.read_bytes()).hexdigest()
     strict=publish(alternate,repo,rev,evidence,env,expect=False)
     assert 'different source/config/tool inputs' in strict.stderr
+    # A prior scanner policy cannot be silently reused under today's gate.
+    inputs_path=directory/'inputs.json'; original_inputs=inputs_path.read_bytes()
+    legacy=json.loads(original_inputs); legacy['scan_policy']={'schema':0}
+    inputs_path.write_text(json.dumps(legacy))
+    refused=publish(alternate,repo,rev,evidence,env,expect=False,extra=['--reuse-sealed'])
+    assert 'different source/config/tool inputs' in refused.stderr and state(statefile)['builds']==1
+    inputs_path.write_bytes(original_inputs)
     # 24h image cleanup must not invalidate durable publication evidence.
     set_state(statefile,local_images=[],require_local_artifact=True)
     result=json.loads(publish(alternate,repo,rev,evidence,env,extra=['--reuse-sealed']).stdout)
     assert result['result']=='published' and result['reused_sealed'] is True
     assert result['evidence_sha256']==original['evidence_sha256']
     assert Path(result['current_scan']).is_file() and Path(result['current_scanner']).is_file()
-    assert result['scan_policy']=={'ignore_unfixed':False,'os_only':False}
+    assert result['scan_policy']['ignore_unfixed'] is False and result['scan_policy']['os_only'] is False
+    assert result['scan_policy']['config']=='disabled'
+    assert Path(result['current_secret_scan']).is_file()
     assert state(statefile)['builds']==1
     assert all((directory/name).read_bytes()==content for name,content in sealed.items())
     set_state(statefile,high_finding=True)
@@ -330,12 +378,50 @@ def test_reuse_requires_complete(binary, base):
     assert 'reuse requires completed sealed publication' in failed.stderr
     assert state(statefile)['builds']==1
 
+def test_scanner_policy_isolation_and_secret_gate(binary, base):
+    repo, rev, evidence, statefile, env=fixture(base,binary)
+    # Project files and caller variables must not control a publication gate.
+    for filename in ('trivy.yaml', '.trivyignore', 'trivy-secret.yaml'):
+        (repo/filename).write_text('caller-controlled\n')
+    cmd(['git','add','.'],repo,env); cmd(['git','commit','-m','scanner override fixture'],repo,env)
+    rev=cmd(['git','rev-parse','HEAD'],repo,env).stdout.strip(); env['MOCK_REV']=rev
+    env.update({'TRIVY_CONFIG':'unsafe.yaml','TRIVY_SKIP_FILES':'*','TRIVY_IGNOREFILE':'.trivyignore',
+                'TRIVY_EXIT_CODE':'0','TRIVY_SEVERITY':'CRITICAL','TRIVY_SCANNERS':'vuln'})
+    set_state(statefile,secret_finding=True)
+    failed=publish(binary,repo,rev,evidence,env,expect=False)
+    assert 'secret gate failed' in failed.stderr and 'do-not-print' not in failed.stderr
+    target='localhost:5000/demo/api:'+rev
+    assert target not in state(statefile)['refs']
+    directory=evidence_dir(evidence,rev)
+    secret=json.loads((directory/'secret-scan.json').read_text())
+    assert secret['Results'][0]['Secrets'][0]['Severity']=='LOW'
+    assert not (directory/'checksums.json').exists()
+    set_state(statefile,secret_finding=False)
+    publish(binary,repo,rev,evidence,env)
+    directory=evidence_dir(evidence,rev)
+    seal=json.loads((directory/'checksums.json').read_text())
+    assert 'secret-scan.json' in seal
+    sealed=json.loads((directory/'evidence.json').read_text())
+    assert sealed['scan_policy']['environment']=='TRIVY_* removed'
+    assert sealed['secrets']['result']=='passed'
+    set_state(statefile,secret_finding=True)
+    publish(binary,repo,rev,evidence,env,expect=False,extra=['--reuse-sealed'])
+    assert state(statefile)['builds']==1
+
+
 def main():
+    global WINDOWS_LAUNCHER
     parser=argparse.ArgumentParser(); parser.add_argument("binary",type=Path); args=parser.parse_args()
     if not args.binary.is_absolute() or not args.binary.is_file(): parser.error("binary must be an existing absolute path")
     binary=args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="devops-tool-publish-") as tmp:
         root=Path(tmp)
+        if os.name == 'nt':
+            source=root/'mock-launcher.rs'; source.write_text(LAUNCHER)
+            WINDOWS_LAUNCHER=root/'mock-launcher.exe'
+            cmd(['rustc',str(source),'-o',str(WINDOWS_LAUNCHER)],root,os.environ.copy())
+        test_scanner_policy_isolation_and_secret_gate(binary,root/'scanner-isolation')
+        print('PASS scanner-isolation')
         for name, test in (("plan",test_plan),("success-retry",test_success_retry),("scan-retry",test_scan_retry),("interrupted-build",test_interrupted_build),("build-metadata-marker",test_build_metadata_without_success_marker),("lookup-errors",test_lookup_errors),("conflicts-move",test_conflicts_and_move),("promote-tamper",test_promote_and_tamper),("scan-content",test_scan_content_gates),("no-config",test_no_config),("effective-inputs-retry",test_effective_inputs_retry),("config-source-guards",test_config_source_guards),("build-arg-policy",test_build_arg_file_and_scan_policy),("reuse-sealed",test_reuse_sealed),("reuse-incomplete",test_reuse_requires_complete)):
             test(binary,root/name); print("PASS",name)
 

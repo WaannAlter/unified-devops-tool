@@ -2,7 +2,7 @@
 //! the toolkit release helper, without inheriting that helper's root credentials.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +25,7 @@ const SEALED_FILES: &[&str] = &[
     "build-metadata.json",
     "build-succeeded.json",
     "scan.json",
+    "secret-scan.json",
     "scanner.json",
     "index.json",
     "sbom.spdx.json",
@@ -62,6 +63,8 @@ struct Inputs {
     build_args_sha256: BTreeMap<String, String>,
     ignore_unfixed: bool,
     os_only: bool,
+    #[serde(default)]
+    scan_policy: Value,
 }
 
 impl Inputs {
@@ -113,7 +116,7 @@ pub fn publish(
     let target = format!("{repository}:{}", snapshot.revision);
     let candidate = format!("{repository}:candidate-{}", snapshot.revision);
     let inputs = Inputs {
-        schema: 3,
+        schema: 4,
         source_sha: snapshot.revision.clone(),
         context_tree: snapshot.tree.clone(),
         config_sha256: snapshot.config_sha256.clone(),
@@ -137,6 +140,7 @@ pub fn publish(
         build_args_sha256: arg_hashes(&build_args),
         ignore_unfixed: options.ignore_unfixed,
         os_only: options.os_only,
+        scan_policy: scan_policy(options.ignore_unfixed, options.os_only),
     };
     if !execute {
         println!(
@@ -291,18 +295,13 @@ pub fn publish(
             .arg(&canonical)
             .output()?;
         crate::verify_inspection(&inspect, revision, &inputs.component)?;
-        let scanner = ProcessPlan::new("trivy")
-            .arg("--version")
-            .arg("--format")
-            .arg("json")
-            .output()?;
-        let scanner: Value = serde_json::from_slice(&scanner)
-            .context("Trivy did not return version/database metadata")?;
+        let scanner = scanner_metadata()?;
         ensure!(
             scanner["Version"].is_string(),
             "missing Trivy version metadata"
         );
-        let scan = scan_plan(&canonical, options.ignore_unfixed, options.os_only).capture()?;
+        let scan =
+            scan_plan(&canonical, options.ignore_unfixed, options.os_only).capture_isolated()?;
         // Keep the report even on a failed gate; do not expose arbitrary subprocess stderr.
         write_bytes(&dir.join("scan.json"), &scan.stdout)?;
         let scan_stderr = dir.join("scan.stderr.log");
@@ -317,14 +316,9 @@ pub fn publish(
         );
         let report: Value = serde_json::from_slice(&scan.stdout)?;
         validate_scan(&report, &canonical)?;
+        scan_secrets(&canonical, &dir, "secret-scan")?;
         // Fetch version again after scanning, since that scan may update the database.
-        let scanner: Value = serde_json::from_slice(
-            &ProcessPlan::new("trivy")
-                .arg("--version")
-                .arg("--format")
-                .arg("json")
-                .output()?,
-        )?;
+        let scanner = scanner_metadata()?;
         ensure!(
             scanner["Version"].is_string()
                 && scanner.pointer("/VulnerabilityDB/UpdatedAt").is_some(),
@@ -356,6 +350,9 @@ pub fn publish(
                     "ignore_unfixed": options.ignore_unfixed, "os_only": options.os_only,
                     "completed_unix_seconds": SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                     "scanner": scanner, "report": "scan.json"},
+                "scan_policy": inputs.scan_policy,
+                "secrets": {"result": "passed", "report": "secret-scan.json",
+                    "severities": ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"]},
                 "sbom": "sbom.spdx.json", "provenance": "provenance.json"
             }),
         )?;
@@ -462,7 +459,7 @@ fn reuse_sealed(
     );
     let report_path = dir.join(format!("{attempt}-scan.json"));
     let stderr_path = dir.join(format!("{attempt}-scan.stderr.log"));
-    let scan = scan_plan(&canonical, options.ignore_unfixed, options.os_only).capture()?;
+    let scan = scan_plan(&canonical, options.ignore_unfixed, options.os_only).capture_isolated()?;
     write_bytes(&report_path, &scan.stdout)?;
     write_bytes(&stderr_path, &scan.stderr)?;
     if !scan.status.success() && !scan_findings_summary(&scan.stdout, &canonical) {
@@ -475,13 +472,8 @@ fn reuse_sealed(
     );
     let report: Value = serde_json::from_slice(&scan.stdout)?;
     validate_scan(&report, &canonical)?;
-    let scanner: Value = serde_json::from_slice(
-        &ProcessPlan::new("trivy")
-            .arg("--version")
-            .arg("--format")
-            .arg("json")
-            .output()?,
-    )?;
+    let secret_path = scan_secrets(&canonical, dir, &format!("{attempt}-secret-scan"))?;
+    let scanner = scanner_metadata()?;
     ensure!(
         scanner["Version"].is_string() && scanner.pointer("/VulnerabilityDB/UpdatedAt").is_some(),
         "missing scanner version or vulnerability database timestamp"
@@ -500,7 +492,9 @@ fn reuse_sealed(
             "evidence_sha256": hash_file(&dir.join("evidence.json"))?,
             "current_scan": report_path, "current_scan_sha256": hash_file(&report_path)?,
             "current_scanner": scanner_path,
-            "scan_policy": {"ignore_unfixed": options.ignore_unfixed, "os_only": options.os_only}
+            "current_secret_scan": secret_path,
+            "current_secret_scan_sha256": hash_file(&secret_path)?,
+            "scan_policy": scan_policy(options.ignore_unfixed, options.os_only)
         }))?
     );
     Ok(())
@@ -568,94 +562,9 @@ fn safe_advisory_id(id: &str) -> bool {
     }
 }
 
-// Child output is untrusted (and may contain build args or Actions workflow commands).
-// Only simple error lines are safe enough for the public CI log; full logs stay private.
-fn failure_excerpt(phase: &str, path: &Path) {
-    let Some(bytes) = (|| -> Option<(bool, Vec<u8>)> {
-        let mut file = File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
-        file.seek(SeekFrom::Start(len.saturating_sub(64 * 1024)))
-            .ok()?;
-        let mut bytes = Vec::new();
-        file.take(64 * 1024).read_to_end(&mut bytes).ok()?;
-        Some((len > 64 * 1024, bytes))
-    })() else {
-        eprintln!("{phase}: diagnostic log unavailable; inspect private evidence");
-        return;
-    };
-    let tail = if bytes.0 {
-        bytes
-            .1
-            .splitn(2, |byte| *byte == b'\n')
-            .nth(1)
-            .unwrap_or(&[])
-    } else {
-        &bytes.1
-    };
-    let decoded = String::from_utf8_lossy(tail);
-    let lines: Vec<_> = decoded
-        .lines()
-        .rev()
-        .filter(|line| {
-            let lower = line.to_ascii_lowercase();
-            (lower.contains("error") || lower.contains("fatal") || lower.contains("failed"))
-                && ![
-                    "password",
-                    "passwd",
-                    "secret",
-                    "token",
-                    "credential",
-                    "authorization",
-                    "cookie",
-                    "api_key",
-                    "apikey",
-                    "access_key",
-                    "private key",
-                    "database_url",
-                    "redis_url",
-                    "://",
-                    "::",
-                    "@",
-                    "?",
-                    "=",
-                ]
-                .iter()
-                .any(|word| lower.contains(word))
-                && line.bytes().all(|byte| (b' '..=b'~').contains(&byte))
-                && !line
-                    .split(|ch: char| !(ch.is_ascii_alphanumeric() || "_+-/".contains(ch)))
-                    .any(|part| part.len() >= 24)
-                && line.len() <= 500
-        })
-        .take(20)
-        .collect();
-    if lines.is_empty() {
-        eprintln!("{phase}: failure output withheld; inspect private evidence");
-        return;
-    }
-    // Suppress GitHub workflow command parsing even if a future filter is loosened.
-    let mut marker = [0_u8; 16];
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        if File::open("/dev/urandom")
-            .and_then(|mut file| file.read_exact(&mut marker))
-            .is_err()
-        {
-            eprintln!("{phase}: failure output withheld; secure command boundary unavailable");
-            return;
-        }
-        eprintln!("::stop-commands::{}", hex_marker(&marker));
-    }
-    eprintln!("{phase}: diagnostic excerpt (full log retained privately):");
-    for line in lines.into_iter().rev() {
-        eprintln!("{line}");
-    }
-    if std::env::var_os("GITHUB_ACTIONS").is_some() {
-        eprintln!("::{}::", hex_marker(&marker));
-    }
-}
-
-fn hex_marker(bytes: &[u8; 16]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+// Arbitrary child output cannot be reliably redacted. Keep it in private evidence.
+fn failure_excerpt(phase: &str, _path: &Path) {
+    eprintln!("{phase}: failure output withheld; inspect private evidence");
 }
 
 fn committed_arg_file(snapshot: &source::Snapshot, path: &Path) -> Result<(String, Vec<u8>)> {
@@ -773,20 +682,45 @@ fn verified_build_metadata(dir: &Path, metadata: &Path) -> Result<Value> {
     read_json(metadata)
 }
 
-fn scan_plan(canonical: &str, ignore_unfixed: bool, os_only: bool) -> ProcessPlan {
-    let mut plan = ProcessPlan::new("trivy")
+pub(crate) fn scanner_plan() -> ProcessPlan {
+    ProcessPlan::new("trivy")
+        .without_env_prefix("TRIVY_")
         .arg("image")
+        .arg("--config")
+        .arg("")
+        .arg("--ignorefile")
+        .arg("")
+        .arg("--secret-config")
+        .arg("")
         .arg("--image-src")
         .arg("docker")
-        .arg("--scanners")
-        .arg("vuln")
-        .arg("--severity")
-        .arg("HIGH,CRITICAL")
         .arg("--exit-code")
         .arg("1")
         .arg("--no-progress")
         .arg("--format")
-        .arg("json");
+        .arg("json")
+}
+
+fn scanner_metadata() -> Result<Value> {
+    let output = ProcessPlan::new("trivy")
+        .without_env_prefix("TRIVY_")
+        .arg("--version")
+        .arg("--format")
+        .arg("json")
+        .capture_isolated()?;
+    ensure!(
+        output.status.success(),
+        "cannot obtain Trivy version/database metadata; captured output withheld"
+    );
+    serde_json::from_slice(&output.stdout).context("Trivy did not return version/database metadata")
+}
+
+pub(crate) fn scan_plan(canonical: &str, ignore_unfixed: bool, os_only: bool) -> ProcessPlan {
+    let mut plan = scanner_plan()
+        .arg("--scanners")
+        .arg("vuln")
+        .arg("--severity")
+        .arg("HIGH,CRITICAL");
     if ignore_unfixed {
         plan = plan.arg("--ignore-unfixed");
     }
@@ -794,6 +728,60 @@ fn scan_plan(canonical: &str, ignore_unfixed: bool, os_only: bool) -> ProcessPla
         plan = plan.arg("--pkg-types").arg("os");
     }
     plan.arg(canonical)
+}
+
+pub(crate) fn secret_scan_plan(canonical: &str) -> ProcessPlan {
+    scanner_plan()
+        .arg("--scanners")
+        .arg("secret")
+        .arg("--severity")
+        .arg("UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL")
+        .arg(canonical)
+}
+
+fn scan_policy(ignore_unfixed: bool, os_only: bool) -> Value {
+    json!({"schema": 1, "config": "disabled", "ignorefile": "disabled",
+        "secret_config": "builtin", "environment": "TRIVY_* removed",
+        "working_directory": "private empty temporary directory",
+        "image_source": "docker", "vulnerability_severities": ["HIGH", "CRITICAL"],
+        "secret_severities": ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+        "ignore_unfixed": ignore_unfixed, "os_only": os_only})
+}
+
+fn scan_secrets(canonical: &str, dir: &Path, name: &str) -> Result<PathBuf> {
+    let scan = secret_scan_plan(canonical).capture_isolated()?;
+    let report_path = dir.join(format!("{name}.json"));
+    write_bytes(&report_path, &scan.stdout)?;
+    write_bytes(&dir.join(format!("{name}.stderr.log")), &scan.stderr)?;
+    ensure!(
+        scan.status.success(),
+        "Trivy secret gate failed ({}); inspect private evidence",
+        scan.status
+    );
+    validate_secret_scan(&serde_json::from_slice(&scan.stdout)?, canonical)?;
+    Ok(report_path)
+}
+
+pub(crate) fn validate_secret_scan(report: &Value, canonical: &str) -> Result<()> {
+    ensure!(
+        report["ArtifactName"] == canonical,
+        "secret scan identifies another artifact"
+    );
+    let results = report["Results"]
+        .as_array()
+        .context("secret scan has no results array")?;
+    for result in results {
+        if let Some(secrets) = result.get("Secrets").filter(|v| !v.is_null()) {
+            ensure!(
+                secrets
+                    .as_array()
+                    .context("invalid secret findings list")?
+                    .is_empty(),
+                "secret scan contains findings; captured output withheld"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_registry(value: &str) -> Result<()> {
@@ -981,7 +969,7 @@ fn contains_key(value: &Value, key: &str) -> bool {
     }
 }
 
-fn validate_scan(report: &Value, canonical: &str) -> Result<()> {
+pub(crate) fn validate_scan(report: &Value, canonical: &str) -> Result<()> {
     ensure!(
         report["ArtifactName"] == canonical,
         "scan identifies another artifact"
@@ -1014,6 +1002,8 @@ fn state_directory(root: &Path, git_root: &Path, target: &str) -> Result<PathBuf
     let root = fs::canonicalize(root)
         .context("create a durable evidence directory outside the Git checkout first")?;
     ensure!(root.is_dir(), "evidence root must be a directory");
+    #[cfg(windows)]
+    crate::process::require_private_path(&root)?;
     ensure!(
         !root.starts_with(git_root),
         "evidence directory must be outside the Git checkout"
@@ -1029,6 +1019,15 @@ fn state_directory(root: &Path, git_root: &Path, target: &str) -> Result<PathBuf
     }
     if !dir.exists() {
         builder.create(&dir)?;
+    }
+    #[cfg(windows)]
+    {
+        crate::process::require_private_path(&dir)?;
+        // Publication state is flat; validate existing entries at its trust boundary,
+        // not in generic hash_file(), which also reads the public tool executable.
+        for entry in fs::read_dir(&dir)? {
+            crate::process::require_private_path(&entry?.path())?;
+        }
     }
     #[cfg(unix)]
     {
@@ -1243,6 +1242,8 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&root).unwrap();
+        #[cfg(windows)]
+        crate::process::protect_new_directory(&root).unwrap();
         let archive = root.join("source.tar");
         let metadata = root.join("build-metadata.json");
         fs::write(&archive, b"source").unwrap();
@@ -1274,6 +1275,14 @@ mod tests {
     #[test]
     fn publish_scan_policy_is_explicit() {
         let strict = scan_plan("repo@sha256:demo", false, false);
+        for flag in ["--config", "--ignorefile", "--secret-config"] {
+            assert!(
+                strict
+                    .args
+                    .windows(2)
+                    .any(|pair| pair[0] == flag && pair[1].is_empty())
+            );
+        }
         assert!(!strict.args.contains(&"--ignore-unfixed".into()));
         assert!(!strict.args.contains(&"--pkg-types".into()));
         let narrowed = scan_plan("repo@sha256:demo", true, true);
@@ -1361,5 +1370,36 @@ mod tests {
         assert!(validate_scan(&ok, "other").is_err());
         assert!(validate_scan(&json!({"ArtifactName":"r", "Results":[]}), "r").is_err());
         assert!(validate_scan(&json!({"ArtifactName":"r", "Results":[{"Target":"os", "Vulnerabilities":[{"Severity":"HIGH"}]}]}), "r").is_err());
+    }
+
+    #[test]
+    fn secret_gate_covers_all_severities_and_rejects_findings_without_echoing_them() {
+        let plan = secret_scan_plan("r");
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|pair| pair == ["--scanners", "secret"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|pair| pair == ["--severity", "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"])
+        );
+        assert!(!plan.args.contains(&"--ignore-unfixed".into()));
+        assert!(!plan.args.contains(&"--pkg-types".into()));
+        assert!(validate_secret_scan(&json!({"ArtifactName":"r","Results":[]}), "r").is_ok());
+        for severity in ["UNKNOWN", "LOW", "MEDIUM", "HIGH", "CRITICAL"] {
+            let report = json!({"ArtifactName":"r","Results":[{"Target":"file","Secrets":[
+                {"Severity":severity,"Match":"do-not-print"}]}]});
+            let error = validate_secret_scan(&report, "r").unwrap_err().to_string();
+            assert!(!error.contains("do-not-print"));
+        }
+        for report in [
+            json!({"ArtifactName":"other","Results":[]}),
+            json!({"ArtifactName":"r"}),
+            json!({"ArtifactName":"r","Results":[{"Secrets":{}}]}),
+        ] {
+            assert!(validate_secret_scan(&report, "r").is_err());
+        }
     }
 }

@@ -130,4 +130,6 @@ The whole-operation deadline uses GNU `timeout` on Linux, including child proces
 
 Profiles, Dockerfiles, and manifests are trusted execution inputs. Image scans and passing checks do not prove an application has no vulnerabilities. Keep registry authentication in the engine's credential configuration and database passwords in local environment variables.
 
+Quality reports refuse existing files (including final symlinks). Failed command output is omitted from console/report details; publication logs stay in private evidence. Use a new report filename for each run. Windows standalone Veriv reports still inherit the destination parent's ACL; choose a private report directory.
+
 Licensed under [MIT](LICENSE). Copyright (c) 2026 Shafwan Taqiyuddin Abror.

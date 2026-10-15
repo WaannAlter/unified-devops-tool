@@ -14,6 +14,10 @@ This previews only. Review the plan before adding `--execute`. Use an isolated l
 
 Publication archives the exact committed context, builds one candidate, scans its digest, records SBOM/provenance and checksums, and promotes that same digest. Ignored/untracked files are excluded; committed sensitive files would still be included. Symlinks, submodules, and archive-changing Git attributes are rejected. Keep build inputs free of secrets.
 
+`scan` and `publish` remove inherited `TRIVY_*` variables and run Trivy from a fresh private, empty directory. They explicitly disable project configuration/ignore files; the empty directory also prevents fallback file loading with older Trivy versions. Docker credentials, proxy settings, and the normal home-directory cache remain available. Vulnerabilities gate HIGH/CRITICAL findings; a separate secret gate checks every severity and is not narrowed by `--os-only` or `--ignore-unfixed`. Detected secrets and raw child output are never printed automatically. Publication retains private reports and seals the effective policy plus the secret report. Legacy publication inputs cannot silently reuse this newer policy.
+
+On Windows, publication evidence and delivery state must be owned by and grant access only to the current user. Unsafe existing ACLs fail closed and are not silently rewritten. Newly created delivery directories receive a protected, inheritable owner-only ACL. Provision private evidence/lock roots before use. Raw evidence can contain secrets; do not upload it unreviewed.
+
 Interrupted builds, conflicting tags, changed source or inputs, incomplete metadata, and altered seals stop for review. Do not delete state or retag images to force a retry. A matching completed candidate may be rescanned and reused. A hash seal detects changes; it does not defend against an administrator able to replace both evidence and its seal.
 
 ## Compose delivery and rollback
@@ -35,5 +39,7 @@ Use only disposable databases for local recovery tests. Roles, grants, other Pos
 ## Development Kubernetes commands
 
 Kubernetes commands require an explicit context and a namespace ending in `-development`. They validate local inputs before optional server-side checks or apply, retain digest-pinned workload expectations, and offer status/rollback.
+
+Dry-run and apply receive the same validated bytes on stdin, not a reread file. Deployments must disable host networking/PID/IPC, privileged/root execution, and privilege escalation; drop all capabilities (only `NET_BIND_SERVICE` may be added) and select RuntimeDefault/Localhost seccomp. A namespace suffix is only an input convention, not proof of cluster identity. Operators must independently verify the context/cluster, restrict RBAC, and enforce the appropriate Pod Security Admission policy; local validation is not an admission controller.
 
 The commands are implemented, but broad cluster acceptance and Production use are not claimed. Do not point test fixtures at a real cluster. GitOps reconciliation remains the responsibility of the selected GitOps controller.

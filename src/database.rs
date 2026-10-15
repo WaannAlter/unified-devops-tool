@@ -436,7 +436,7 @@ fn secure_permissions(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn secure_permissions(path: &Path) -> Result<()> {
+pub(crate) fn secure_permissions(path: &Path) -> Result<()> {
     // Replace (rather than amend) the DACL, including any explicit default ACEs.
     // The path is an environment value, never interpolated into PowerShell code.
     ProcessPlan::new("powershell.exe")
